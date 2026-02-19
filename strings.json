@@ -1,0 +1,18 @@
+{
+    "config": {
+        "step": {
+            "user": {
+                "title": "TOU Writer Setup",
+                "description": "Enter your Teslemetry API token and Tesla Energy Site ID. These are stored securely in Home Assistant and used when pushing TOU schedules.",
+                "data": {
+                    "teslemetry_token": "Teslemetry API Token",
+                    "site_id": "Tesla Energy Site ID"
+                }
+            }
+        },
+        "error": {
+            "token_required": "Teslemetry API token is required.",
+            "site_id_required": "Tesla Energy Site ID is required."
+        }
+    }
+}
