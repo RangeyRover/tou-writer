@@ -1,0 +1,209 @@
+alias: Amber → Tesla TOU Push (with MQTT Dedup)
+description: "Reads Amber 5-min forecasts, aggregates to 30-min TOU slots, and pushes to Tesla. Uses MQTT to store state and prevent duplicate pushes. Supports Force Discharge/Charge modes via input_select."
+mode: restart
+max_exceeded: silent
+
+triggers:
+  - trigger: homeassistant
+    event: start
+    id: start
+  - trigger: time_pattern
+    minutes: "/5"
+    id: schedule
+  - trigger: state
+    entity_id: input_select.powerwall_mode
+    id: override
+
+actions:
+  # --- 1. SETTLEMENT DELAY (Only for Schedule) ---
+  # Amber prices settle ~35s after the 5-min mark. Wait 1 min to be safe.
+  # If triggered manually/override, skip delay for immediate action.
+  - if:
+      - condition: trigger
+        id: "schedule"
+    then:
+      - delay: "00:01:00"
+
+  # --- 2. CALCULATE RATES ---
+  - variables:
+      # CONFIGURATION
+      mqtt_topic_root: "home/amber/tou_rates"
+      price_adjustment_c: 100
+
+      # MODE & STATE
+      control_mode: "{{ states('input_select.powerwall_mode') }}"
+      # Adjustment logic is now per-slot, so we don't apply it globally here.
+      # But we still need plan name updates.
+      
+      # Plan Name Label
+      mode_suffix: >-
+        {% if control_mode == 'Discharge Start' %} (Discharge)
+        {% elif control_mode == 'Charge Start' %} (Charge)
+        {% else %}{% endif %}
+      plan_name: "Amber {{ mode_suffix }} @ {{ now().strftime('%H:%M') }}"
+      
+      # INPUT SENSORS
+      import_forecasts: >-
+        {{ state_attr('sensor.4_rosella_general_forecast', 'forecasts') | default([], true) }}
+      export_forecasts: >-
+        {{ state_attr('sensor.4_rosella_feed_in_forecast', 'forecasts') | default([], true) }}
+
+      # LOGIC
+      ts0: >-
+        {{ now().replace(hour=0, minute=0, second=0, microsecond=0).timestamp() | float }}
+      now_ts: >-
+        {{ now().timestamp() | float }}
+
+      # Generate 30-min slots (Rolling 24h: past slots fill with tomorrow's data)
+      calculated_rates: >-
+        {% set out = namespace(items=[]) %}
+        {% for i in range(0,48) %}
+          {% set s_today = ts0 + (i*1800) %}
+          {% set e_today = s_today + 1800 %}
+          
+          {# ROLLOVER LOGIC: If slot has ended, target tomorrow's slot instead #}
+          {% set is_past = e_today < now_ts %}
+          {% set target_s = s_today + (86400 if is_past else 0) %}
+          {% set target_e = target_s + 1800 %}
+
+          {# FORCE DISCHARGE LOGIC: Apply boost only if mode is Discharge Start AND slot is in next 1 hour #}
+          {# We need to identify if this slot is 'current' or 'next'. #}
+          {# Since slots roll over, the slot covering 'now' is the one where s_today <= now_ts < e_today. #}
+          {# BUT wait, 'is_past' check handles rollover. #}
+          {# Actually, simplicity: Apply boost to the FIRST 2 iterations that land in the future? #}
+          {# No, the loop is fixed 0..47 based on time of day. #}
+          {# We need to check if target_s is close to now_ts. #}
+          {# target_s is the start time of the slot we are generating. #}
+          {# If target_s >= now_ts (future) and target_s < now_ts + 3600 (next hour). #}
+          {# Wait, the current slot starts in the past (s < now) but ends in future. #}
+          {# So condition: target_e > now_ts AND target_s < now_ts + 3600. #}
+          
+          {% set apply_boost = false %}
+          {% if control_mode == 'Discharge Start' %}
+            {# Check if slot overlaps the next hour from now #}
+            {% if target_e > now_ts and target_s < (now_ts + 3600) %}
+              {% set apply_boost = true %}
+            {% endif %}
+          {% endif %}
+          
+          {% set boost = price_adjustment_c if apply_boost else 0 %}
+
+          {# BUY RATE AVG #}
+          {% set accb = namespace(sum=0.0, dur=0.0) %}
+          {% for p in import_forecasts %}
+            {% set ps = as_timestamp(p.start_time) %}
+            {% set pe = as_timestamp(p.end_time) %}
+            {% if ps is not none and pe is not none %}
+              {% set os = [ps,target_s]|max %}
+              {% set oe = [pe,target_e]|min %}
+              {% if oe > os %}
+                {% set d = oe-os %}
+                {% set accb.sum = accb.sum + (p.per_kwh|float(0))*d %}
+                {% set accb.dur = accb.dur + d %}
+              {% endif %}
+            {% endif %}
+          {% endfor %}
+          {% set buy_raw = ((accb.sum/accb.dur) if accb.dur>0 else 0)*100 %}
+          {% set buy = buy_raw + boost %}
+
+          {# SELL RATE AVG #}
+          {% set accs = namespace(sum=0.0, dur=0.0) %}
+          {% for p in export_forecasts %}
+            {% set ps = as_timestamp(p.start_time) %}
+            {% set pe = as_timestamp(p.end_time) %}
+            {% if ps is not none and pe is not none %}
+              {% set os = [ps,target_s]|max %}
+              {% set oe = [pe,target_e]|min %}
+              {% if oe > os %}
+                {% set d = oe-os %}
+                {% set accs.sum = accs.sum + (p.per_kwh|float(0))*d %}
+                {% set accs.dur = accs.dur + d %}
+              {% endif %}
+            {% endif %}
+          {% endfor %}
+          {% set sell_raw = ((accs.sum/accs.dur) if accs.dur>0 else 0)*100 %}
+          {% set sell = sell_raw + boost %}
+          
+          {# Output uses today's HH:MM labels for the schedule #}
+          {% set start_str = (s_today|timestamp_custom('%H:%M',true)) %}
+          {% set end_str   = (e_today|timestamp_custom('%H:%M',true)) %}
+
+          {% set out.items = out.items + [{
+            'start': start_str,
+            'end': (end_str if end_str != "00:00" else "00:00"), 
+            'buy': buy|round(1),
+            'sell': sell|round(1)
+          }] %}
+        {% endfor %}
+        
+        {# Fix midnight end time for last slot #}
+        {% set fixed = namespace(items=[]) %}
+        {% for r in out.items %}
+          {% if loop.last %}
+            {% set fixed.items = fixed.items + [dict(r,**{'end':'00:00'})] %}
+          {% else %}
+            {% set fixed.items = fixed.items + [r] %}
+          {% endif %}
+        {% endfor %}
+        {{ fixed.items }}
+
+  # --- 3. MQTT AUTO-DISCOVERY (ensure sensor exists) ---
+  - action: mqtt.publish
+    data:
+      topic: "homeassistant/sensor/amber_tou_last_push_hash/config"
+      retain: true
+      payload: >-
+        {
+          "name": "Amber TOU Last Push Hash",
+          "unique_id": "amber_tou_last_push_hash",
+          "state_topic": "{{ mqtt_topic_root }}/state",
+          "json_attributes_topic": "{{ mqtt_topic_root }}/attributes",
+          "icon": "mdi:timeline-check"
+        }
+
+  # --- 4. CHECK FOR CHANGE ---
+  # Compare newly calculated rates against stored rates
+  # ALSO check if Plan Name changed (e.g. Mode change), because rates might be same but name different?
+  # Actually, if plan_name changed, user sees update.
+  # But if rates are same, pushing again is fine? No, waste of API.
+  # But if plan_name changed (e.g. from Normal to Charge), we WANT to push so app shows status.
+  # So we should compare plan_name too?
+  # Wait, if mode changed, 'adjustment' changes, so 'calculated_rates' changes.
+  # So check is still valid: calculated_rates != stored_rates.
+  # EXCEPTION: If adjustment is 0 (Normal vs Charge), rates are identical.
+  # Plan name differs.
+  # So we MUST check plan_name or force push on mode change.
+  # Easier: check plan_name against stored attribute? Or just include plan_name in the comparison.
+  # But the stored attribute is 'rates'.
+  # I'll update the condition to also check if input_select changed?
+  # Or simply: if trigger.id == 'override', skip the check?
+  # YES. If override, always push.
+  - condition: or
+    conditions:
+      - condition: trigger
+        id: "override"
+      - condition: template
+        value_template: >-
+          {{ calculated_rates != state_attr('sensor.amber_tou_last_push_hash', 'rates') }}
+
+  # --- 5. PUSH TO TESLA ---
+  - action: tou_writer.push_tou
+    data:
+      plan_name: "{{ plan_name }}"
+      rates: "{{ calculated_rates }}"
+
+  # --- 6. UPDATE PERSISTENCE ---
+  - action: mqtt.publish
+    data:
+      topic: "{{ mqtt_topic_root }}/state"
+      retain: true
+      payload: "{{ now().isoformat() }}"
+
+  - action: mqtt.publish
+    data:
+      topic: "{{ mqtt_topic_root }}/attributes"
+      retain: true
+      payload: >-
+        {
+          "rates": {{ calculated_rates | to_json }}
+        }
