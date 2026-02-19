@@ -1,0 +1,29 @@
+push_tou:
+  name: Push TOU Schedule
+  description: >
+    Push a Time-of-Use rate schedule to your Tesla Powerwall via Teslemetry.
+    Provide buy/sell rates in cents/kWh for each time period.
+    Credentials are taken from the integration setup — no need to enter them here.
+  fields:
+    rates:
+      name: Rate Periods
+      description: >
+        List of rate periods covering the full 24 hours.
+        Each period has: start (HH:MM), end (HH:MM), buy (c/kWh), sell (c/kWh).
+      required: true
+      example:
+        - start: "00:00"
+          end: "07:00"
+          buy: 15.0
+          sell: 5.0
+        - start: "07:00"
+          end: "00:00"
+          buy: 35.0
+          sell: 10.0
+    plan_name:
+      name: Rate Plan Name
+      description: >
+        Optional display name for the rate plan shown in the Tesla app.
+        Defaults to "Custom TOU (TOU Writer)" if not provided.
+      required: false
+      example: "My TOU Plan"
