@@ -137,13 +137,16 @@ def _build_tariff(
         end_m = end_slot % 60
 
         tou_periods[key] = {
-            "name": key,
-            "fromDayOfWeek": 0,
-            "toDayOfWeek": 6,
-            "fromHour": h,
-            "fromMinute": m,
-            "toHour": end_h if end_h < 24 else 0,
-            "toMinute": end_m,
+            "periods": [
+                {
+                    "fromDayOfWeek": 0,
+                    "toDayOfWeek": 6,
+                    "fromHour": h,
+                    "fromMinute": m,
+                    "toHour": end_h if end_h < 24 else 0,
+                    "toMinute": end_m,
+                }
+            ]
         }
 
     name = plan_name or DEFAULT_PLAN_NAME
