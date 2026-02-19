@@ -66,17 +66,17 @@ actions:
           {% set target_s = s_today + (86400 if is_past else 0) %}
           {% set target_e = target_s + 1800 %}
 
-          {# FORCE DISCHARGE LOGIC: Apply boost only if mode is Discharge Start AND slot is in next 1 hour #}
-          {# We need to identify if this slot is 'current' or 'next'. #}
-          {# Since slots roll over, the slot covering 'now' is the one where s_today <= now_ts < e_today. #}
-          {# BUT wait, 'is_past' check handles rollover. #}
-          {# Actually, simplicity: Apply boost to the FIRST 2 iterations that land in the future? #}
-          {# No, the loop is fixed 0..47 based on time of day. #}
-          {# We need to check if target_s is close to now_ts. #}
-          {# target_s is the start time of the slot we are generating. #}
-          {# If target_s >= now_ts (future) and target_s < now_ts + 3600 (next hour). #}
-          {# Wait, the current slot starts in the past (s < now) but ends in future. #}
-          {# So condition: target_e > now_ts AND target_s < now_ts + 3600. #}
+          {# Force discharge:
+             Apply the boost only when Discharge Start mode is active,
+             and only for slots that fall within the next hour.
+          
+             A slot counts if:
+             - it hasn’t finished yet (end > now)
+             - it starts within the next hour (start < now + 3600)
+          
+             This includes the current slot and the next one if applicable.
+          #}
+
           
           {% set apply_boost = false %}
           {% if control_mode == 'Discharge Start' %}
@@ -160,24 +160,19 @@ actions:
           "json_attributes_topic": "{{ mqtt_topic_root }}/attributes",
           "icon": "mdi:timeline-check"
         }
-
+  
   # --- 4. CHECK FOR CHANGE ---
-  # Compare newly calculated rates against stored rates
-  # ALSO check if Plan Name changed (e.g. Mode change), because rates might be same but name different?
-  # Actually, if plan_name changed, user sees update.
-  # But if rates are same, pushing again is fine? No, waste of API.
-  # But if plan_name changed (e.g. from Normal to Charge), we WANT to push so app shows status.
-  # So we should compare plan_name too?
-  # Wait, if mode changed, 'adjustment' changes, so 'calculated_rates' changes.
-  # So check is still valid: calculated_rates != stored_rates.
-  # EXCEPTION: If adjustment is 0 (Normal vs Charge), rates are identical.
-  # Plan name differs.
-  # So we MUST check plan_name or force push on mode change.
-  # Easier: check plan_name against stored attribute? Or just include plan_name in the comparison.
-  # But the stored attribute is 'rates'.
-  # I'll update the condition to also check if input_select changed?
-  # Or simply: if trigger.id == 'override', skip the check?
-  # YES. If override, always push.
+  # Only push to Tesla if something actually changed.
+  # Compare the newly calculated rates with the stored ones.
+  #
+  # Mode changes normally alter the rates, so they’ll trigger a push anyway.
+  # The only exception is when different modes produce identical rates.
+  # In that case we still want to push if this run was triggered by an override.
+  #
+  # So:
+  # - If rates changed → push
+  # - If manual override trigger → always push
+
   - condition: or
     conditions:
       - condition: trigger
@@ -207,3 +202,4 @@ actions:
         {
           "rates": {{ calculated_rates | to_json }}
         }
+
